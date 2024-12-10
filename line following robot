@@ -1,0 +1,586 @@
+import time
+import board
+import digitalio
+import pwmio
+import random
+
+
+#LED pins
+led_red = digitalio.DigitalInOut(board.LED_R)
+led_red.direction = digitalio.Direction.OUTPUT
+led_green = digitalio.DigitalInOut(board.LED_G)
+led_green.direction = digitalio.Direction.OUTPUT
+led_blue = digitalio.DigitalInOut(board.LED_B)
+led_blue.direction = digitalio.Direction.OUTPUT
+
+# Initialize all LEDs to OFF
+led_red.value = 1
+led_blue.value = 1
+led_green.value = 1
+
+# Motor pins
+motor_L_DIR = digitalio.DigitalInOut(board.D4)
+motor_L_DIR.direction = digitalio.Direction.OUTPUT
+motor_L_PWM = pwmio.PWMOut(board.D5, frequency=1000)
+
+motor_R_DIR = digitalio.DigitalInOut(board.D6)
+motor_R_DIR.direction = digitalio.Direction.OUTPUT
+motor_R_PWM = pwmio.PWMOut(board.D7, frequency=1000)
+
+# Encoder pins
+encoder_LA_pin = digitalio.DigitalInOut(board.D2)
+encoder_LA_pin.direction = digitalio.Direction.INPUT
+encoder_LA_pin.pull = digitalio.Pull.UP
+encoder_LB_pin = digitalio.DigitalInOut(board.D3)
+encoder_LB_pin.direction = digitalio.Direction.INPUT
+encoder_LB_pin.pull = digitalio.Pull.UP
+
+encoder_RA_pin = digitalio.DigitalInOut(board.D11)
+encoder_RA_pin.direction = digitalio.Direction.INPUT
+encoder_RA_pin.pull = digitalio.Pull.UP
+encoder_RB_pin = digitalio.DigitalInOut(board.D12)
+encoder_RB_pin.direction = digitalio.Direction.INPUT
+encoder_RB_pin.pull = digitalio.Pull.UP
+
+# PID constants
+kp = 0.8
+ki = 0.1
+kd = 0.05
+MAX_INTEGRAL = 100
+PULSE_CALC_TIME = 0.05
+
+# PID global variables
+integral = 0
+previous_error = 0
+
+# Encoder global variables
+pulse_count_LA = 0
+pulse_count_LB = 0
+last_encoder_state_LA = encoder_LA_pin.value
+last_encoder_state_LB = encoder_LB_pin.value
+pulse_count_RA = 0
+pulse_count_RB = 0
+last_encoder_state_RA = encoder_RA_pin.value
+last_encoder_state_LB = encoder_RB_pin.value
+last_encoder_state_LA = False
+last_encoder_state_LB = False
+last_encoder_state_RA = False
+last_encoder_state_RB = False
+
+# Kickstart Constants
+MIN_KICKSTART_DUTY_CYCLE = 5
+KICKSTART_DURATION = 0.05
+
+# Robot-specific constants
+WHEEL_DIAMETER = 7.2  # in cm
+WHEELBASE = 14.9      # distance between wheels in cm
+ENCODER_RESOLUTION = 1440 # pulses per wheel revolution
+
+# Kickstart global variables
+left_flag_kickstarted = False
+right_flag_kickstarted = False
+previous_direction = 0
+
+# QTRX Sensor Array pins
+qtrx_pins = [digitalio.DigitalInOut(pin) for pin in [board.A7, board.A6, board.A5, board.A4, board.A3, board.A2, board.A1, board.A0]]
+#for qtrx_pin in qtrx_pins:
+#    qtrx_pin.direction = digitalio.Direction.INPUT
+#Control_Odd = digitalio.DigitalInOut(board.A7)
+#Control_Odd.direction = digitalio.Direction.OUTPUT
+Control_Even = digitalio.DigitalInOut(board.D10)
+Control_Even.direction = digitalio.Direction.OUTPUT
+
+# Serpintine Constansts
+base_speed = 20
+kp_steering = 2#was 0.8
+
+turn_offset = 2
+
+counter = 0
+
+# Define the sequence of states for the robot
+states = [
+    "SERPENTINE",          # Navigate through the serpentine section
+    "STRAIGHTAWAY",        # Follow the straight line
+    "T_TURNS",              # Perform a T-turn
+    "FORK",                # Navigate through a fork in the line
+    "TURN_AROUND",         # Turn around at the end of the course
+    "REVERSE_FORK",        # Navigate back through the fork
+    "REVERSE_T_TURNS",      # Perform a reverse T-turn
+    "REVERSE_STRAIGHTAWAY",# Follow the straight line back
+    "REVERSE_SERPENTINE"   # Reverse through the serpentine section
+]
+'''
+# Sates global variables
+current_state = None       # The current state of the robot
+running = False            # Flag to indicate whether the robot is running
+state_num = 0              # Index of the current state in the sequence
+in_transition = False      # Flag to indicate if the robot is transitioning between states
+first_run = True           # Flag to indicate the first run of the robot
+'''
+# States global variables
+current_state = None       # The current state of the robot
+running = False            # Flag to indicate whether the robot is running
+state_num = 0              # Index of the current state in the sequence
+in_transition = False      # Flag to indicate if the robot is transitioning between states
+first_run = True           # Flag to indicate the first run of the robot
+last_transition_time = 0   # Time of the last state transition
+transition_buffer = 2      # Buffer time in seconds to prevent rapid transitions
+
+# Initialize the button for starting/stopping the robot
+button1 = digitalio.DigitalInOut(board.D9)
+button1.direction = digitalio.Direction.INPUT  # Set the button as an input
+button1.pull = digitalio.Pull.UP               # Enable an internal pull-up resistor
+
+def read_sensor(qtrx_pin):
+    # Read sensor and return values as a list
+    #Control_Odd.value = True # Set odd to high
+    Control_Even.value = True # Set Even to high
+    qtrx_pin.direction = digitalio.Direction.OUTPUT # Set pins as output
+    qtrx_pin.value = True # Set Pins to high
+    time.sleep(0.000002) # Give a 10 microseconds for buffer
+    qtrx_pin.direction = digitalio.Direction.INPUT # Set pins as input
+    start_time = time.monotonic() # Start time monotonic
+    while qtrx_pin.value and (time.monotonic() - start_time < 0.01): # Buffer
+        pass
+    # Calculate the Decay
+    '''
+    Check if the light is being absorbed or charged
+    '''
+    decay_time = (time.monotonic() - start_time) * 1000000
+    #Control_Odd.value = False
+    Control_Even.value = False
+    time.sleep(0.001)
+    return decay_time
+
+# Define a function to read all the sensors
+def read_sensors():
+    '''
+    This reads every single sensor by calling each pin that will be intialized in the funciton above
+    '''
+    return[read_sensor(pin) for pin in qtrx_pins]
+
+def normalized_sensor(sensor_values):
+    # set reference values for white and black
+    white_value = 1000
+    black_value = 2000
+    # Create a threshold for the readings
+    threshold = (black_value + white_value) / 2
+    '''
+    Normalize the sensor readings to return a 0 or a 1 for reading over or black or white
+    '''
+    normalized = [ 1 if reading > threshold else 0 for reading in sensor_values ]
+    return normalized
+
+def error_balance(sensor_values):
+     # Normalized the sensor values before use
+    normalized_val = normalized_sensor(sensor_values)
+    print("Normalized Sensor Values:", normalized_val)
+    #print("made it to error balance")##################################
+
+    '''
+    Determines how straight and how much a robot should turn depending on the error
+    if error is closer to -3 then turn towards sensor 1 (RIGHT)
+    if error is closer to 3 then turn towards sensor 6 (LEFT)
+    '''
+    # place higher 'weight' on the outside sensor to detect where to turn on path
+    weights = [-4,-3, -2, -1, 1, 2, 3, 4]
+    error = sum(weights * value for weights, value in zip(weights, normalized_val))
+    '''
+    black and white threshold for acceptable range of continuation on path - black cap: 0.7 and white cap: 0.3
+    Determines all the sensors are all white, if the robot is off the path
+    Dtermines all the sensors are all black, if the robot is on a mark for change of state
+    '''
+    all_black = all(value <= 0.3 for value in normalized_val)
+    all_white = all(value >= 0.7 for value in normalized_val)
+
+    return error, all_black, all_white
+
+def duty_cycle_16bit(percent):
+    """
+    Convert a percentage to a 16-bit duty cycle value
+    :param percent: Percentage value (0 to 100)
+    :return: 16-bit duty cycle value
+    """
+    return int(percent * 65535 / 100)
+
+def calculate_pulses_for_rotation(degrees):
+    """
+    Calculate the number of pulses required to rotate the robot by a certain number of degrees.
+    :param degrees: Degrees to rotate (-360 to +360)
+    :return: Number of pulses needed to rotate the robot by the specified number of degrees
+    """
+    robot_circumference = 3.14159 * WHEELBASE  # Circumference of the robot's turning circle
+    arc_length = (degrees / 360.0) * robot_circumference  # Distance each wheel needs to travel
+    wheel_circumference = 3.14159 * WHEEL_DIAMETER  # Circumference of the wheel
+    wheel_rotations = arc_length / wheel_circumference  # Rotations needed for arc length
+    pulses = int(wheel_rotations * ENCODER_RESOLUTION)  # Convert rotations to encoder pulses
+    return pulses
+
+def read_encoder():
+    """
+    Read the encoder pins and update the pulse count.
+    """
+    global pulse_count_LA, pulse_count_LB, pulse_count_RA, pulse_count_RB
+    global last_encoder_state_LA, last_encoder_state_LB, last_encoder_state_RA, last_encoder_state_RB
+    # Read the state of the encoder pins
+    current_state_LA = encoder_LA_pin.value
+    current_state_LB = encoder_LB_pin.value
+    current_state_RA = encoder_RA_pin.value
+    current_state_RB = encoder_RB_pin.value
+
+    # Left encoder pulse count
+    if current_state_LA != last_encoder_state_LA:
+        if current_state_LA == False:
+            pulse_count_LA += 1 if current_state_LB == True else -1
+    if current_state_LB != last_encoder_state_LB:
+        if current_state_LB == False:
+            pulse_count_LB += 1 if current_state_LA == True else -1
+
+    # Right encoder pulse count
+    if current_state_RA != last_encoder_state_RA:
+        if current_state_RA == False:
+            pulse_count_RA += 1 if current_state_RB == True else -1
+    if current_state_RB != last_encoder_state_RB:
+        if current_state_RB == False:
+            pulse_count_RB += 1 if current_state_RA == True else -1
+
+    # Update the last encoder state
+    last_encoder_state_LA = current_state_LA
+    last_encoder_state_LB = current_state_LB
+    last_encoder_state_RA = current_state_RA
+    last_encoder_state_RB = current_state_RB
+
+def set_motor_speed(L_Speed, R_Speed):
+    """
+    Set the motor speeds, including kickstart logic.
+    """
+    global left_flag_kickstarted, right_flag_kickstarted
+    abs_L_Speed = abs(L_Speed)
+    abs_R_Speed = abs(R_Speed)
+
+    # Set motor direction
+    motor_L_DIR.value = L_Speed < 0
+    motor_R_DIR.value = R_Speed < 0
+
+    L_sign = 1 if L_Speed >= 0 else -1
+    R_sign = 1 if R_Speed >= 0 else -1
+
+    # Kickstart for low speeds
+    if abs_L_Speed < MIN_KICKSTART_DUTY_CYCLE and not left_flag_kickstarted and abs_L_Speed is not 0:
+        motor_L_PWM.duty_cycle = duty_cycle_16bit(5*L_sign)
+        left_flag_kickstarted = True
+        time.sleep(KICKSTART_DURATION)
+    else:
+        left_flag_kickstarted = False
+
+    if abs_R_Speed < MIN_KICKSTART_DUTY_CYCLE and not right_flag_kickstarted and abs_R_Speed is not 0:
+        motor_R_PWM.duty_cycle = duty_cycle_16bit(5*R_sign)
+        right_flag_kickstarted = True
+        time.sleep(KICKSTART_DURATION)
+    else:
+        right_flag_kickstarted = False
+
+    motor_L_PWM.duty_cycle = duty_cycle_16bit(abs_L_Speed)
+    motor_R_PWM.duty_cycle = duty_cycle_16bit(abs_R_Speed)
+
+def pid(setpoint, current_rpm):
+    """
+    PID controller to control the motor speed.
+    :param setpoint: Desired speed in RPM
+    :param current_rpm: Current speed in RPM
+    :return: Duty cycle value to be set on the motor
+    """
+    global integral, previous_error, kp, ki, kd, feedforward
+
+    # Feedforward component (estimated duty cycle for desired speed)
+    feedforward = setpoint * 0.5
+
+    # Error term
+    error = setpoint - current_rpm
+
+    # Proportional term
+    proportional = kp * error
+
+    # Integral term with anti-windup
+    integral += error * PULSE_CALC_TIME
+    integral = max(min(integral, MAX_INTEGRAL), -MAX_INTEGRAL)
+    integral_term = ki * integral
+
+    # Derivative term
+    derivative_term = kd * (error - previous_error) / PULSE_CALC_TIME
+    previous_error = error
+
+    # Total output
+    output = feedforward + proportional + integral_term + derivative_term
+
+    # Clamp output to 0-100% range
+    output = max(0, min(100, output))
+    return output
+
+def motor_control_with_pid(target_L_rpm, target_R_rpm):
+    """
+    Control the motors using PID to reach the target RPMs.
+    :param target_L_rpm: Target RPM for the left motor
+    :param target_R_rpm: Target RPM for the right motor
+    """
+    global pulse_count_LA, pulse_count_RA
+
+    # Read encoder to estimate current RPM
+    read_encoder()
+    current_L_rpm = (pulse_count_LA / ENCODER_RESOLUTION) * 60 / PULSE_CALC_TIME
+    current_R_rpm = (pulse_count_RA / ENCODER_RESOLUTION) * 60 / PULSE_CALC_TIME
+
+    # Compute PID outputs for both motors
+    L_PWM = pid(target_L_rpm, current_L_rpm)
+    R_PWM = pid(target_R_rpm, current_R_rpm)
+
+    # Apply PID-calculated speeds to motors
+    set_motor_speed(L_PWM, R_PWM)
+
+def rotate_degrees(degrees, speed=30):
+    """
+    Rotate the robot by a specified number of degrees using PID control.
+    :param degrees: Target rotation in degrees (-360 to 360). Positive for clockwise, negative for counter-clockwise.
+    :param speed: Speed for the rotation in RPM (default is 30).
+    """
+    adjusted_degrees = degrees // 4 # Adjust degrees to account for the gear ratio
+    target_pulses = calculate_pulses_for_rotation(adjusted_degrees)
+    current_pulse_diff = 0
+    
+    print("Rotating by", degrees, "Pulses:", target_pulses)
+    
+    # Reset encoder pulse counts
+    global pulse_count_LA, pulse_count_RA, turn_offset, counter
+    pulse_count_LA = 0
+    pulse_count_RA = 0
+    read_encoder()
+
+    # Perform rotation until the target pulse count is reached
+    while abs(current_pulse_diff) < abs(target_pulses) + turn_offset:
+        read_encoder()
+
+        # Calculate pulse difference (use one side for simplicity)
+        current_pulse_diff = (pulse_count_RA - pulse_count_LA) // 2
+        """
+        # print every 100 the cycle
+        if counter % 100 == 0:
+            print("Pulses:", current_pulse_diff)
+        counter += 1
+        """
+        # Set motor speeds for rotation
+        if degrees > 0:  # Clockwise
+            set_motor_speed(speed, -speed)
+            #pass
+        else:  # Counter-Clockwise
+            set_motor_speed(-speed, speed)
+            #pass
+
+    # Stop motors after completing the rotation
+    set_motor_speed(0, 0)
+    time.sleep(0.2)
+
+def start_stop_robot():
+    """
+    Toggle the robot's running state when the button is pressed.
+    If the button is pressed, this function switches the robot between
+    running and stopped states.
+    """
+    global running, current_state
+    
+    # Read sensor values
+    sensor_values = read_sensors()
+
+    # Calculate error, all_white, and all_black from sensor values
+    error, all_white, all_black = error_balance(sensor_values)
+
+    # LED indicator for starting/stopping the robot
+
+    if all_black:
+        led_red.value = 1
+        led_green.value = 0
+    else:
+        led_red.value = 0
+        led_green.value = 1
+
+    if not button1.value:  # Check if the button is pressed (value is False due to pull-up)
+        running = not running  # Toggle the running state
+        if running:
+            led_red.value = 1
+            led_green.value = 1
+            print("Robot starting...", "Run Flag: ", running)
+    else:
+        set_motor_speed(0,0) # motor stops when no other state available
+        print("Robot stopped.")
+    time.sleep(0.5)  # Debounce delay to avoid multiple triggers
+
+def transition():
+    """
+    Transition to the next state in the state machine.
+    This function updates the current state to the next in the sequence.
+    """
+    global current_state, state_num, last_transition_time
+    
+    # Check if buffer time has passed since the last transition
+    if time.time() - last_transition_time > transition_buffer:
+        if current_state in states:
+            current_index = states.index(current_state)  # Find the index of the current state
+            # Move to the next state, or set to None if at the end of the sequence
+            current_state = states[current_index + 1] if current_index + 1 < len(states) else None
+            last_transition_time = time.time()  # Update the last transition time
+        else:
+            current_state = None  # End of the state sequence
+
+
+def execute_state(current_state, error):
+    """
+    Execute the current state of the robot.
+    """
+    # print("Current state:", current_state)
+
+    if current_state == "SERPENTINE":
+        #print("made it to execute state")###################
+        Serpentine(error)
+    elif current_state == "STRAIGHTAWAY":
+        Straightaway(error)
+    elif current_state == "T_TURNS":
+        T_Turns(error)
+    elif current_state == "FORK":
+        Fork()
+    elif current_state == "TURN_AROUND":
+        Turn_Around()
+    elif current_state == "REVERSE_FORK":
+        Fork()
+    elif current_state == "REVERSE_T_TURNS":
+        T_Turns()
+    elif current_state == "REVERSE_STRAIGHTAWAY":
+        Straightaway()
+    elif current_state == "REVERSE_SERPENTINE":
+        Serpentine()
+    else:
+        print("Invalid state")
+        set_motor_speed(0, 0)  # Stop motors when finished
+
+        
+def Serpentine(error):
+    global base_speed, kp_steering
+    #print("made it to serpentine error")
+    #print("THIS IS THE ERROR VALUE:",error)
+    # Calculate steering adjustment based on error
+    steering_adjustment = kp_steering * error
+    left_motor_speed = base_speed + steering_adjustment
+    right_motor_speed = base_speed - steering_adjustment
+
+    # Clamp motor speeds within valid range (0-100)
+    left_motor_speed = max(0, min(100, left_motor_speed))
+    right_motor_speed = max(0, min(100, right_motor_speed))
+    print("THIS IS THE LEFT MOTOR SPEED:",left_motor_speed)
+    print("THIS IS THE RIGHT MOTOR SPEED",right_motor_speed)
+    # Set motor speeds for serpentine navigation
+    set_motor_speed(left_motor_speed, right_motor_speed)
+
+def Straightaway(error):
+    global base_speed, kp_steering
+    #print("made it to serpentine error")
+    #print("THIS IS THE ERROR VALUE:",error)
+    # Calculate steering adjustment based on error
+    steering_adjustment = kp_steering * error
+    left_motor_speed = base_speed + steering_adjustment
+    right_motor_speed = base_speed - steering_adjustment
+
+    # Clamp motor speeds within valid range (0-100)
+    left_motor_speed = max(0, min(100, left_motor_speed))
+    right_motor_speed = max(0, min(100, right_motor_speed))
+    print("THIS IS THE LEFT MOTOR SPEED:",left_motor_speed)
+    print("THIS IS THE RIGHT MOTOR SPEED",right_motor_speed)
+    # Set motor speeds for serpentine navigation
+    set_motor_speed(left_motor_speed, right_motor_speed)
+
+def T_Turns(error):
+    # Read sensor values
+    base_speed = 30
+    kp_steering = 2
+    #sensor_values = read_sensors()
+
+    # Calculate all_white and all_black from sensor values
+    #_, all_white, all_black = error_balance(sensor_values)
+    
+    steering_adjustment = kp_steering * error
+    left_motor_speed = base_speed + steering_adjustment
+    right_motor_speed = base_speed - steering_adjustment
+    # Clamp motor speeds within valid range (0-100)
+    left_motor_speed = max(0, min(100, left_motor_speed))
+    right_motor_speed = max(0, min(100, right_motor_speed))
+    print("THIS IS THE LEFT MOTOR SPEED:",left_motor_speed)
+    print("THIS IS THE RIGHT MOTOR SPEED",right_motor_speed)
+    # Set motor speeds for serpentine navigation
+    set_motor_speed(left_motor_speed, right_motor_speed)
+    
+    # Check sensor conditions for 90-degree turns
+    left_black_right_white = all(sensor_values[i] > 2000 for i in range(4)) and all(sensor_values[i] < 2000 for i in range(5, 8))
+    left_white_right_black = all(sensor_values[i] < 2000 for i in range(3)) and all(sensor_values[i] > 2000 for i in range(4, 8))
+    
+    if left_black_right_white:
+        rotate_degrees(-90)  # Perform a 90-degree left turn
+        #time.sleep(0.1)
+    elif left_white_right_black:
+        rotate_degrees(90)  # Perform a 90-degree right turn
+        #time.sleep(0.1)
+    return
+    
+def Fork():
+    # Read sensor values
+    sensor_values = read_sensors()
+
+    # Calculate error, all_white, and all_black from sensor values
+    error, all_white, all_black = error_balance(sensor_values)
+    
+    return all_black, all_white
+
+def Turn_Around():
+    # Read sensor values
+    sensor_values = read_sensors()
+
+    # Calculate error, all_white, and all_black from sensor values
+    error, all_white, all_black = error_balance(sensor_values)
+    
+    return all_black, all_white
+    
+# Test setup for the SERPENTINE state
+current_state = "T_TURNS"
+while True:
+    '''
+    if first_run:
+        while not running:
+            start_stop_robot()
+            first_run = False
+
+    if running:
+        sensor_values = read_sensors()
+        error, all_white, all_black = error_balance(sensor_values)
+            
+        execute_state(current_state, error)
+            
+        if all_black:
+            set_motor_speed(0, 0)
+            transition()
+            print("Transitioning to next state:", current_state)
+            time.sleep(0.5)
+        elif all_white:
+            set_motor_speed(0,0)
+    '''
+
+    if first_run:
+        while running == False:
+            start_stop_robot()
+            first_run = False
+    
+    if running:
+        sensor_values = read_sensors()
+        error, all_white, all_black = error_balance(sensor_values)
+        
+        execute_state(current_state, error)
+        
+        if all_white:
+            set_motor_speed(0,0)
+            
